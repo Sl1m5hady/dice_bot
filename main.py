@@ -8,14 +8,16 @@ from threading import Lock
 from time import monotonic
 
 import telebot
+from telebot.apihelper import ApiException
 from telebot.types import Message
 
-from dice_parser import DICE_SIDES
+from dice_parser import DICE_SIDES, MAX_EXPRESSION_LENGTH
 from service import find_formulas, roll_replies
 from telegram_replies import ReplySender
 
 
 TOKEN_PATH = Path("token.txt")
+MAX_FORMULA_FILE_BYTES = 4 * MAX_EXPRESSION_LENGTH
 REQUESTS_PER_WINDOW = 5
 RATE_WINDOW_SECONDS = 10
 RATE_LIMIT_MESSAGE = "Слишком много запросов. Попробуй чуть позже."
@@ -40,6 +42,8 @@ HELP = (
     "<code>d20; 2d6+3</code> — два отдельных броска. Можно писать их на разных строках, "
     "в том числе в нумерованном списке.\n"
     "<code>2d6 — Урон мечом</code> — подпись после тире с пробелами до конца строки.\n\n"
+    f"Формулы до {MAX_EXPRESSION_LENGTH} символов можно прислать файлом <code>.txt</code> в UTF-8. "
+    "Длинный результат придёт файлом.\n\n"
     "<code>/start</code> — приветствие. <code>/help</code> — эта справка."
 )
 
@@ -124,6 +128,43 @@ def create_bot(token: str, *, threaded: bool = True) -> telebot.TeleBot:
         formulas = find_formulas(message.text)
         if formulas and allow_request(message):
             sender.submit(message, roll_replies(formulas))
+
+    @bot.message_handler(
+        content_types=["document"],
+        func=lambda message: (message.document.file_name or "").lower().endswith(".txt"),
+    )
+    def roll_file(message: Message) -> None:
+        if not allow_request(message):
+            return
+        document = message.document
+        oversized = f"Файл должен занимать не больше {MAX_FORMULA_FILE_BYTES} байт."
+        if document.file_size is not None and document.file_size > MAX_FORMULA_FILE_BYTES:
+            sender.submit(message, (oversized,))
+            return
+        try:
+            file = bot.get_file(document.file_id)
+            size = file.file_size if file.file_size is not None else document.file_size
+            if size is None or not file.file_path:
+                sender.submit(message, ("Не удалось получить файл.",))
+                return
+            if size > MAX_FORMULA_FILE_BYTES:
+                sender.submit(message, (oversized,))
+                return
+            content = bot.download_file(file.file_path)
+        except (ApiException, OSError):
+            sender.submit(message, ("Не удалось скачать файл.",))
+            return
+        if len(content) > MAX_FORMULA_FILE_BYTES:
+            sender.submit(message, (oversized,))
+            return
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            sender.submit(message, ("Сохрани .txt в кодировке UTF-8.",))
+            return
+        formulas = find_formulas(text)
+        replies = roll_replies(formulas) if formulas else ["В файле нет формул с кубиками."]
+        sender.submit(message, replies)
 
     return bot
 

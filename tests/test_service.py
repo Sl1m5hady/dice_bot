@@ -2,8 +2,8 @@ from html.parser import HTMLParser
 from itertools import product
 import unittest
 
-from dice_parser import DICE_SIDES, MAX_DEPTH, MAX_DICE_PER_TERM, MAX_EXPRESSION_LENGTH, MAX_FORMULAS
-from service import MAX_DESCRIPTION_LENGTH, MAX_REPLY_LENGTH, find_formulas, roll_replies
+from dice_parser import DICE_SIDES, MAX_DICE_PER_EXPRESSION, MAX_EXPRESSION_LENGTH, MAX_FORMULAS
+from service import MAX_DESCRIPTION_LENGTH, MAX_REPLY_LENGTH, RollDocument, find_formulas, roll_replies
 
 
 def replies(text, *values):
@@ -79,7 +79,7 @@ class DiceServiceTests(unittest.TestCase):
                     self.assertEqual(replies(text, *faces), replies(canonical, *faces))
 
     def test_keep_shorthand_across_explicit_roll_counts(self):
-        for sides, rule, count in product(DICE_SIDES, ("kh", "kl"), (1, 2, 4, MAX_DICE_PER_TERM)):
+        for sides, rule, count in product(DICE_SIDES, ("kh", "kl"), (1, 2, 4, 100)):
             faces = tuple(index % sides + 1 for index in range(count))
             canonical = f"{count}d{sides}{rule}1"
             for text in (f"{count}d{sides}{rule}", f"d{sides}({count}){rule}"):
@@ -162,16 +162,49 @@ class DiceServiceTests(unittest.TestCase):
         self.assertIn(f"<b>{10**100}</b>", replies("0d6+10**100")[0])
         self.assertIn("<b>1e+100</b>", replies("0d6+10.**100")[0])
         self.assertIn("Слишком большое", replies("d6+" + "9" * 102)[0])
+        self.assertIn("Слишком большое", replies("d6+" + "9" * (MAX_EXPRESSION_LENGTH - 3))[0])
 
     def test_limits(self):
         full = "d6" + " " * (MAX_EXPRESSION_LENGTH - 4) + "+1"
         self.assertEqual(replies(full, 2), ["🎲2 + 1 = <b>3</b>"])
         self.assertIn("длина формулы", replies(full.replace("+", " +"))[0])
-        self.assertEqual(replies("(" * MAX_DEPTH + "d6()" + ")" * MAX_DEPTH, 3), ["🎲3 = <b>3</b>"])
-        self.assertIn("вложенность", replies("(" * (MAX_DEPTH + 1) + "d6" + ")" * (MAX_DEPTH + 1))[0])
-        self.assertIn("100 кубиков", replies("101d6")[0])
-        self.assertIn("500 кубиков", replies("+".join(["100d6"] * 5 + ["d6"]))[0])
+        self.assertIn(f"{MAX_DICE_PER_EXPRESSION} кубиков", replies(f"{MAX_DICE_PER_EXPRESSION + 1}d6")[0])
+        self.assertIn(f"{MAX_DICE_PER_EXPRESSION} кубиков", replies(f"{MAX_DICE_PER_EXPRESSION}d6+d4")[0])
         self.assertEqual(replies(", ".join(["d6"] * (MAX_FORMULAS + 1))), ["Максимум 5 формул в сообщении."])
+
+    def test_very_long_and_deep_expressions(self):
+        depth = (MAX_EXPRESSION_LENGTH - 2) // 2
+        count_depth = (MAX_EXPRESSION_LENGTH - 5) // 2
+        cases = {
+            "вложенность": ("(" * depth + "d6" + ")" * depth, 3),
+            "сложение": ("d6" + "+1" * depth, 3 + depth),
+            "степени": ("1**" * ((MAX_EXPRESSION_LENGTH - 2) // 3) + "d6", 1),
+            "унарные знаки": ("-" * (MAX_EXPRESSION_LENGTH - 2) + "d6", 3),
+            "старый синтаксис": ("d6(" + "(" * count_depth + "1" + ")" * count_depth + ")", 3),
+        }
+        for name, (text, expected) in cases.items():
+            with self.subTest(expression=name):
+                result = replies(text, 3)
+                if isinstance(result[0], RollDocument):
+                    body = result[0].content.decode("utf-8")
+                else:
+                    body = "".join(result)
+                self.assertIn(f"= <b>{expected}</b>", body)
+
+    def test_large_rolls_keep_every_die_in_chat_or_file(self):
+        count = 1_000
+        chunks = replies(f"{count}d6", *([1] * count))
+        combined = "".join(chunks)
+        self.assertEqual(combined.count("🎲1"), count)
+        self.assertTrue(combined.endswith(f"= <b>{count}</b>"))
+
+        count = MAX_DICE_PER_EXPRESSION
+        document, = replies(f"{count}d6kh1 — <атака>", *([1] * count))
+        self.assertIsInstance(document, RollDocument)
+        html = document.content.decode("utf-8")
+        self.assertEqual(html.count("🎲1"), count)
+        self.assertEqual(html.count("<s>"), count - 1)
+        self.assertIn("= <b>1</b> — &lt;атака&gt;", html)
 
     def test_long_replies_keep_all_dice_and_complete_tags(self):
         class TagCheck(HTMLParser):

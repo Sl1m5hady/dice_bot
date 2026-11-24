@@ -1,21 +1,20 @@
 """Evaluate dice rolls and format compact Telegram replies."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from html import escape
 import random
 
 from dice_parser import (
     PRECEDENCE,
+    UNARY_OPERATORS,
     UNARY_PRECEDENCE,
-    Binary,
     Dice,
-    Expression,
     Formula,
     FormulaError,
+    Instruction,
     MAX_FORMULAS,
     Number,
-    Unary,
     calculate,
     find_formulas as find_formulas,
     parse_formula,
@@ -24,23 +23,33 @@ from dice_parser import (
 
 MAX_DESCRIPTION_LENGTH = 120
 MAX_REPLY_LENGTH = 4096
+MAX_REPLY_PARTS = 10
 ADDITION = PRECEDENCE["+"]
 ATOM = max(PRECEDENCE.values()) + 1
 OPERATOR_DISPLAY = {"*": "×", "**": "^"}
 
 RandInt = Callable[[int, int], int]
+RenderPart = str | tuple["RenderPart", ...]
+
+
+@dataclass(frozen=True)
+class RollDocument:
+    content: bytes
+
+
+Reply = str | RollDocument
 
 
 @dataclass(frozen=True)
 class Result:
     value: int | float
-    parts: tuple[str, ...]
+    parts: tuple[RenderPart, ...]
     precedence: int = ATOM
     dice_sum: bool = False
 
 
-def _parenthesize(parts: tuple[str, ...], needed: bool) -> tuple[str, ...]:
-    return ("(", *parts, ")") if needed else parts
+def _parenthesize(parts: tuple[RenderPart, ...], needed: bool) -> tuple[RenderPart, ...]:
+    return ("(", parts, ")") if needed else parts
 
 
 def _roll(dice: Dice, randint: RandInt) -> Result:
@@ -73,21 +82,7 @@ def _roll(dice: Dice, randint: RandInt) -> Result:
     )
 
 
-def _evaluate(expression: Expression, randint: RandInt) -> Result:
-    if isinstance(expression, Number):
-        return Result(expression.value, (escape(str(expression.value)),))
-    if isinstance(expression, Dice):
-        return _roll(expression, randint)
-    if isinstance(expression, Unary):
-        operand = _evaluate(expression.operand, randint)
-        value = -operand.value if expression.symbol == "-" else operand.value
-        parts = _parenthesize(operand.parts, operand.precedence < UNARY_PRECEDENCE)
-        return Result(value, (expression.symbol, *parts), UNARY_PRECEDENCE)
-
-    assert isinstance(expression, Binary)
-    left = _evaluate(expression.left, randint)
-    right = _evaluate(expression.right, randint)
-    symbol = expression.symbol
+def _combine(left: Result, symbol: str, right: Result) -> Result:
     precedence = PRECEDENCE[symbol]
     value = calculate(symbol, left.value, right.value)
 
@@ -99,14 +94,43 @@ def _evaluate(expression: Expression, randint: RandInt) -> Result:
         right.precedence == precedence and symbol != "**" and not flatten_dice_sum
     )
     right_parts = _parenthesize(right.parts, wrap_right)
-    return Result(value, (*left_parts, f" {OPERATOR_DISPLAY.get(symbol, symbol)} ", *right_parts), precedence)
+    return Result(value, (left_parts, f" {OPERATOR_DISPLAY.get(symbol, symbol)} ", right_parts), precedence)
+
+
+def _evaluate(instructions: Sequence[Instruction], randint: RandInt) -> Result:
+    values: list[Result] = []
+    for item in instructions:
+        if isinstance(item, Number):
+            values.append(Result(item.value, (escape(str(item.value)),)))
+        elif isinstance(item, Dice):
+            values.append(_roll(item, randint))
+        elif item in UNARY_OPERATORS:
+            operand = values.pop()
+            parts = _parenthesize(operand.parts, operand.precedence < UNARY_PRECEDENCE)
+            value = UNARY_OPERATORS[item](operand.value)
+            values.append(Result(value, (item[-1], parts), UNARY_PRECEDENCE))
+        else:
+            right = values.pop()
+            values.append(_combine(values.pop(), item, right))
+    return values.pop()
+
+
+def _fragments(parts: tuple[RenderPart, ...]) -> Iterator[str]:
+    # Each operation references its operands without copying their output.
+    pending: list[RenderPart] = [parts]
+    while pending:
+        part = pending.pop()
+        if isinstance(part, str):
+            yield part
+        else:
+            pending.extend(reversed(part))
 
 
 def _format_formula(formula: Formula, randint: RandInt) -> tuple[str, ...]:
     if len(formula.description) > MAX_DESCRIPTION_LENGTH:
         raise FormulaError(f"Максимальная длина подписи — {MAX_DESCRIPTION_LENGTH} символов.")
     result = _evaluate(parse_formula(formula.text), randint)
-    parts = (*result.parts, f" = <b>{escape(str(result.value))}</b>")
+    parts = (*_fragments(result.parts), f" = <b>{escape(str(result.value))}</b>")
     if formula.description:
         parts = (*parts, f" — {escape(formula.description)}")
     return parts
@@ -139,7 +163,7 @@ def _split_replies(lines: Sequence[tuple[str, ...]]) -> list[str]:
     return replies
 
 
-def roll_replies(formulas: Sequence[Formula], *, randint: RandInt | None = None) -> list[str]:
+def roll_replies(formulas: Sequence[Formula], *, randint: RandInt | None = None) -> list[Reply]:
     if len(formulas) > MAX_FORMULAS:
         return [f"Максимум {MAX_FORMULAS} формул в сообщении."]
     if randint is None:
@@ -151,4 +175,12 @@ def roll_replies(formulas: Sequence[Formula], *, randint: RandInt | None = None)
             lines.append(_format_formula(formula, randint))
         except FormulaError as error:
             lines.append((escape(str(error)),))
-    return _split_replies(lines)
+    replies = _split_replies(lines)
+    if len(replies) > MAX_REPLY_PARTS:
+        body = "\n".join("".join(line) for line in lines)
+        html = (
+            '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Результаты бросков</title>'
+            f'<pre style="white-space: pre-wrap">{body}</pre></html>'
+        )
+        return [RollDocument(html.encode("utf-8"))]
+    return list(replies)

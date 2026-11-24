@@ -1,6 +1,6 @@
 """Find dice expressions in chat text and parse a restricted arithmetic grammar."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 import math
 import operator
@@ -8,11 +8,9 @@ import re
 
 
 DICE_SIDES = (4, 6, 8, 10, 12, 20, 100)
-MAX_EXPRESSION_LENGTH = 200
-MAX_DICE_PER_TERM = 100
-MAX_DICE_PER_EXPRESSION = 500
+MAX_EXPRESSION_LENGTH = 33_000
+MAX_DICE_PER_EXPRESSION = 33_000
 MAX_FORMULAS = 5
-MAX_DEPTH = 20
 MAX_MAGNITUDE = 10**100
 MAX_EXPONENT = 100
 DESCRIPTION_SEPARATOR = " — "
@@ -32,6 +30,8 @@ KEEP_RE = re.compile(KEEP_NOTATION)
 
 PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2, "//": 2, "**": 4}
 UNARY_PRECEDENCE = 3
+UNARY_OPERATORS = {"u+": operator.pos, "u-": operator.neg}
+OPERATOR_PRECEDENCE = PRECEDENCE | dict.fromkeys(UNARY_OPERATORS, UNARY_PRECEDENCE)
 OPERATIONS = {
     "+": operator.add,
     "-": operator.sub,
@@ -64,20 +64,7 @@ class Dice:
     kept: int
 
 
-@dataclass(frozen=True)
-class Unary:
-    symbol: str
-    operand: "Expression"
-
-
-@dataclass(frozen=True)
-class Binary:
-    symbol: str
-    left: "Expression"
-    right: "Expression"
-
-
-Expression = Number | Dice | Unary | Binary
+Instruction = Number | Dice | str
 
 
 def _formula_spans(text: str) -> Iterator[tuple[int, int]]:
@@ -187,17 +174,79 @@ def calculate(symbol: str, left: int | float, right: int | float) -> int | float
     return check_number(result)
 
 
-def _evaluate_count(expression: Expression) -> int | float:
-    if isinstance(expression, Number):
-        return expression.value
-    if isinstance(expression, Unary):
-        value = _evaluate_count(expression.operand)
-        return -value if expression.symbol == "-" else value
-    if isinstance(expression, Binary):
-        return calculate(
-            expression.symbol, _evaluate_count(expression.left), _evaluate_count(expression.right)
-        )
-    raise FormulaError("Количество кубиков должно быть числом.")
+def _bounded_int(text: str, limit: int, error: str) -> int:
+    digits = text.lstrip("0") or "0"
+    maximum = str(limit)
+    if len(digits) > len(maximum) or (len(digits) == len(maximum) and digits > maximum):
+        raise FormulaError(error)
+    return int(digits)
+
+
+def _plain_token(token: re.Match[str]) -> Number | str:
+    text = token.group()
+    if token.lastgroup != "number":
+        return text
+    if "." in text:
+        return Number(check_number(float(text)))
+    return Number(_bounded_int(text, MAX_MAGNITUDE, "Слишком большое число."))
+
+
+def _compile(tokens: Iterable[Instruction]) -> list[Instruction]:
+    """Convert infix tokens to postfix instructions using an operator stack."""
+    instructions: list[Instruction] = []
+    operators: list[str] = []
+    expect_operand = True
+    for token in tokens:
+        if expect_operand:
+            if not isinstance(token, str):
+                instructions.append(token)
+                expect_operand = False
+            elif token in ("+", "-"):
+                operators.append("u" + token)
+            elif token == "(":
+                operators.append(token)
+            else:
+                raise FormulaError("Неверная формула.")
+        elif token == ")":
+            while operators and operators[-1] != "(":
+                instructions.append(operators.pop())
+            if not operators:
+                raise FormulaError("Лишняя закрывающая скобка.")
+            operators.pop()
+        elif isinstance(token, str) and token in PRECEDENCE:
+            precedence = PRECEDENCE[token]
+            while operators and operators[-1] != "(":
+                previous = OPERATOR_PRECEDENCE[operators[-1]]
+                if previous < precedence or (previous == precedence and token == "**"):
+                    break
+                instructions.append(operators.pop())
+            operators.append(token)
+            expect_operand = True
+        else:
+            raise FormulaError("Неверная формула.")
+
+    if expect_operand:
+        raise FormulaError("Неверная формула.")
+    while operators:
+        symbol = operators.pop()
+        if symbol == "(":
+            raise FormulaError("Не хватает закрывающей скобки.")
+        instructions.append(symbol)
+    return instructions
+
+
+def _evaluate_count(tokens: Iterable[re.Match[str]]) -> int | float:
+    values: list[int | float] = []
+    for item in _compile(_plain_token(token) for token in tokens):
+        if isinstance(item, Number):
+            values.append(item.value)
+        elif isinstance(item, str) and item in UNARY_OPERATORS:
+            values.append(UNARY_OPERATORS[item](values.pop()))
+        else:
+            assert isinstance(item, str)
+            right = values.pop()
+            values.append(calculate(item, values.pop(), right))
+    return values.pop()
 
 
 class Parser:
@@ -214,60 +263,39 @@ class Parser:
         self.index += 1
         return token
 
-    def expect_close(self) -> None:
-        if self.peek() != ")":
-            raise FormulaError("Не хватает закрывающей скобки." if not self.peek() else "Неверная формула.")
-        self.take()
-
-    def expression(self, min_precedence: int = 1, depth: int = 0, *, allow_dice: bool = True) -> Expression:
-        if depth > MAX_DEPTH:
-            raise FormulaError(f"Максимальная вложенность — {MAX_DEPTH}.")
-        if not self.peek():
-            raise FormulaError("Неверная формула.")
-
-        token = self.take()
-        symbol = token.group()
-        if symbol in ("+", "-"):
-            operand = self.expression(UNARY_PRECEDENCE, depth + 1, allow_dice=allow_dice)
-            left = Unary(symbol, operand)
-        elif symbol == "(":
-            left = self.expression(depth=depth + 1, allow_dice=allow_dice)
-            self.expect_close()
-        elif token.lastgroup == "number":
-            left = Number(check_number(float(symbol) if "." in symbol else int(symbol)))
-        elif token.lastgroup == "dice" and allow_dice:
-            left = self.dice(token, depth)
-        else:
-            raise FormulaError("Неверная формула.")
-
-        while PRECEDENCE.get(self.peek(), 0) >= min_precedence:
+    def count_argument(self) -> list[re.Match[str]]:
+        self.take()  # Opening parenthesis.
+        start = self.index
+        depth = 1
+        while self.index < len(self.tokens):
             symbol = self.take().group()
-            precedence = PRECEDENCE[symbol]
-            if symbol == "**":
-                right = self.expression(precedence, depth + 1, allow_dice=allow_dice)
-            else:
-                right = self.expression(precedence + 1, depth, allow_dice=allow_dice)
-            left = Binary(symbol, left, right)
-        return left
+            if symbol == "(":
+                depth += 1
+            elif symbol == ")":
+                depth -= 1
+                if depth == 0:
+                    return self.tokens[start:self.index - 1]
+        raise FormulaError("Не хватает закрывающей скобки.")
 
-    def dice(self, token: re.Match[str], depth: int) -> Dice:
+    def dice(self, token: re.Match[str]) -> Dice:
         notation = DICE_RE.fullmatch(token.group())
         if notation is None:
             raise FormulaError("Неверная запись кубика. Для преимущества — d20kh, для помехи — d20kl.")
 
         count_text, sides_text, keep, kept_text = notation.groups()
-        sides = int(sides_text)
+        sides_error = "Допустимые кубики — d4, d6, d8, d10, d12, d20 и d100."
+        sides = _bounded_int(sides_text, max(DICE_SIDES), sides_error)
         if sides not in DICE_SIDES:
-            raise FormulaError("Допустимые кубики — d4, d6, d8, d10, d12, d20 и d100.")
+            raise FormulaError(sides_error)
 
-        count = int(count_text) if count_text else None
+        rolls_error = f"Максимум {MAX_DICE_PER_EXPRESSION} кубиков в формуле."
+        count = _bounded_int(count_text, MAX_DICE_PER_EXPRESSION, rolls_error) if count_text else None
         if self.peek() == "(" and self.tokens[self.index].start() == token.end():
-            self.take()
-            if self.peek() != ")":
+            argument = self.count_argument()
+            if argument:
                 if count is not None:
                     raise FormulaError("Укажи количество кубиков один раз.")
-                count = _evaluate_count(self.expression(depth=depth + 1, allow_dice=False))
-            self.expect_close()
+                count = _evaluate_count(argument)
             closing = self.tokens[self.index - 1]
             if keep is None and self.peek() and self.tokens[self.index].start() == closing.end():
                 suffix = KEEP_RE.fullmatch(self.peek())
@@ -279,29 +307,30 @@ class Parser:
             count = 2 if keep and kept_text is None else 1
         if not isinstance(count, int) or count < 0:
             raise FormulaError("Количество кубиков должно быть целым числом от нуля.")
-        if count > MAX_DICE_PER_TERM:
-            raise FormulaError(f"Максимум {MAX_DICE_PER_TERM} кубиков за один бросок.")
         self.rolls += count
         if self.rolls > MAX_DICE_PER_EXPRESSION:
-            raise FormulaError(f"Максимум {MAX_DICE_PER_EXPRESSION} кубиков в формуле.")
+            raise FormulaError(rolls_error)
 
         kept = count
         if keep:
-            kept = int(kept_text) if kept_text is not None else 1
-        if keep and not 1 <= kept <= count:
-            raise FormulaError("kh/kl должны оставлять от одного до числа брошенных кубиков.")
+            keep_error = "kh/kl должны оставлять от одного до числа брошенных кубиков."
+            kept = _bounded_int(kept_text, count, keep_error) if kept_text is not None else 1
+            if not 1 <= kept <= count:
+                raise FormulaError(keep_error)
         return Dice(sides, count, keep.lower() if keep else None, kept)
 
+    def atoms(self) -> list[Instruction]:
+        atoms: list[Instruction] = []
+        while self.index < len(self.tokens):
+            token = self.take()
+            atoms.append(self.dice(token) if token.lastgroup == "dice" else _plain_token(token))
+        return atoms
 
-def parse_formula(text: str) -> Expression:
+
+def parse_formula(text: str) -> list[Instruction]:
     if len(text) > MAX_EXPRESSION_LENGTH:
         raise FormulaError(f"Максимальная длина формулы — {MAX_EXPRESSION_LENGTH} символов.")
-    parser = Parser(text)
-    expression = parser.expression()
-    if parser.peek():
-        if parser.peek() == ")":
-            raise FormulaError("Лишняя закрывающая скобка.")
-        raise FormulaError("Неверная формула.")
-    if not any(token.lastgroup == "dice" for token in parser.tokens):
+    instructions = _compile(Parser(text).atoms())
+    if not any(isinstance(item, Dice) for item in instructions):
         raise FormulaError("В формуле нужен хотя бы один кубик.")
-    return expression
+    return instructions

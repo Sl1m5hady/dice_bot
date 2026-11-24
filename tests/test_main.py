@@ -18,15 +18,18 @@ class TelegramTests(unittest.TestCase):
         self.bot = main.create_bot("123456:test_only", threaded=False)
         self.message_id = 0
 
-    def receive(self, text, *, user_id=1, topic=None):
+    def receive(self, text=None, *, user_id=1, topic=None, document=None):
         self.message_id += 1
         payload = {
             "message_id": self.message_id,
             "from": {"id": user_id, "is_bot": False, "first_name": "Тест"},
             "chat": {"id": -100, "type": "supergroup"},
             "date": 1,
-            "text": text,
         }
+        if document is None:
+            payload["text"] = text
+        else:
+            payload["document"] = {"file_id": "test", "file_unique_id": "test", "file_name": "roll.txt", **document}
         if topic is not None:
             payload.update(message_thread_id=topic, is_topic_message=True)
         self.bot.process_new_messages([Message.de_json(payload)])
@@ -69,6 +72,47 @@ class TelegramTests(unittest.TestCase):
             self.receive("d6()+")
         self.assertEqual(send.call_args.kwargs["reply_parameters"].message_id, 2)
         self.assertEqual(send.call_args.args[1], "Неверная формула.")
+
+    def test_reads_long_txt_and_replies_with_the_complete_result_file(self):
+        repeats = (main.MAX_EXPRESSION_LENGTH - 2) // 2
+        text = "d6" + "+1" * repeats
+        downloaded = text.encode("utf-8")
+        file = SimpleNamespace(file_size=len(downloaded), file_path="documents/file.txt")
+        files = []
+
+        def record_file(chat_id, document, **kwargs):
+            self.assertEqual(chat_id, -100)
+            self.assertEqual(kwargs["reply_parameters"].message_id, 1)
+            self.assertEqual(kwargs["message_thread_id"], 4)
+            files.append(document.file.read().decode("utf-8"))
+
+        with (
+            patch.object(self.bot, "get_file", return_value=file) as get_file,
+            patch.object(self.bot, "download_file", return_value=downloaded) as download,
+            patch.object(self.bot, "send_document", side_effect=record_file) as send_document,
+            patch.object(self.bot, "send_message") as send,
+            patch("service.random.randint", return_value=2),
+        ):
+            self.receive(document={"file_size": len(downloaded)}, topic=4)
+        get_file.assert_called_once_with("test")
+        download.assert_called_once_with(file.file_path)
+        send_document.assert_called_once()
+        send.assert_not_called()
+        self.assertIn(f"🎲2{' + 1' * repeats} = <b>{2 + repeats}</b>", files[0])
+
+    def test_txt_errors_are_reported_as_replies(self):
+        file = SimpleNamespace(file_size=3, file_path="documents/file.txt")
+        with (
+            patch.object(self.bot, "get_file", return_value=file) as get_file,
+            patch.object(self.bot, "download_file", return_value=b"\xff\xfe\x00") as download,
+            patch.object(self.bot, "send_message") as send,
+        ):
+            self.receive(document={"file_size": main.MAX_FORMULA_FILE_BYTES + 1})
+            get_file.assert_not_called()
+            self.receive(document={"file_size": 3})
+            download.assert_called_once()
+        self.assertIn("не больше", send.call_args_list[0].args[1])
+        self.assertIn("UTF-8", send.call_args_list[1].args[1])
 
     def test_addressed_commands_are_checked_before_rate_limiting(self):
         identity = SimpleNamespace(username="Dice_Bot")

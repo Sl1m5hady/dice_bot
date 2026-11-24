@@ -6,6 +6,7 @@ from telebot import TeleBot
 from telebot.apihelper import ApiTelegramException
 from telebot.types import Message
 
+from service import RollDocument
 from telegram_replies import BUSY_REPLY, GROUP_INTERVAL, ReplySender
 
 
@@ -91,3 +92,29 @@ class ReplySenderTests(unittest.TestCase):
         with patch("telegram_replies.MAX_PENDING_PER_CHAT", 1):
             ReplySender(bot, threaded=False).submit(message, ["первая", "вторая"])
         bot.reply_to.assert_called_once_with(message, BUSY_REPLY, parse_mode="HTML", message_thread_id=None)
+
+    def test_document_bytes_count_until_successful_retry_across_chats(self):
+        bot = Mock(spec=TeleBot)
+        bot.send_document.side_effect = [flood_error(7), None, None]
+        clock = [0.0]
+        first = group_message(-100)
+        second = group_message(-200)
+        document = RollDocument(b"result")
+
+        def advance(seconds):
+            sender.submit(second, [document])
+            clock[0] += seconds
+
+        with (
+            patch("telegram_replies.MAX_PENDING_DOCUMENT_BYTES", len(document.content)),
+            patch("telegram_replies.GROUP_INTERVAL", 0),
+            patch("telegram_replies.monotonic", side_effect=lambda: clock[0]),
+            patch("telegram_replies.Condition") as condition,
+        ):
+            condition.return_value.wait.side_effect = advance
+            sender = ReplySender(bot, threaded=False)
+            sender.submit(first, [document])
+            sender.submit(second, [document])
+
+        bot.reply_to.assert_called_once_with(second, BUSY_REPLY, parse_mode="HTML", message_thread_id=None)
+        self.assertEqual([call.args[0] for call in bot.send_document.call_args_list], [-100, -100, -200])

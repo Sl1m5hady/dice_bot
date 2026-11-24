@@ -3,26 +3,30 @@
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from io import BytesIO
 from logging import getLogger
 from threading import Condition, Thread
 from time import monotonic
 
 from telebot import TeleBot
 from telebot.apihelper import ApiTelegramException
-from telebot.types import Message
+from telebot.types import InputFile, Message, ReplyParameters
+
+from service import Reply, RollDocument
 
 
 CHAT_INTERVAL = 1.0
 GROUP_INTERVAL = 3.1
 MAX_PENDING_PER_CHAT = 100
-BUSY_REPLY = "В чате накопилось много бросков. Попробуй чуть позже."
+MAX_PENDING_DOCUMENT_BYTES = 32 * 1024 * 1024
+BUSY_REPLY = "Очередь ответов заполнена. Попробуй чуть позже."
 LOGGER = getLogger(__name__)
 
 
 @dataclass
 class ChatOutbox:
     interval: float
-    pending: deque[tuple[Message, str]] = field(default_factory=deque)
+    pending: deque[tuple[Message, Reply]] = field(default_factory=deque)
     ready_at: float = 0.0
     busy_notice_queued: bool = False
 
@@ -34,16 +38,22 @@ class ReplySender:
         self.chats: dict[int, ChatOutbox] = {}
         self.condition = Condition()
         self.running = False
+        self.pending_document_bytes = 0
 
-    def submit(self, message: Message, replies: Sequence[str]) -> None:
+    def submit(self, message: Message, replies: Sequence[Reply]) -> None:
         if not replies:
             return
 
+        document_bytes = sum(len(reply.content) for reply in replies if isinstance(reply, RollDocument))
         interval = GROUP_INTERVAL if message.chat.type in {"group", "supergroup"} else CHAT_INTERVAL
         with self.condition:
             chat = self.chats.setdefault(message.chat.id, ChatOutbox(interval))
-            if len(chat.pending) + len(replies) <= MAX_PENDING_PER_CHAT:
-                chat.pending.extend((message, text) for text in replies)
+            if (
+                len(chat.pending) + len(replies) <= MAX_PENDING_PER_CHAT
+                and self.pending_document_bytes + document_bytes <= MAX_PENDING_DOCUMENT_BYTES
+            ):
+                chat.pending.extend((message, reply) for reply in replies)
+                self.pending_document_bytes += document_bytes
             elif not chat.busy_notice_queued:
                 chat.pending.append((message, BUSY_REPLY))
                 chat.busy_notice_queued = True
@@ -85,20 +95,32 @@ class ReplySender:
                 chat = self._next_chat()
                 if chat is None:
                     return
-                message, text = chat.pending[0]
+                message, reply = chat.pending[0]
 
-            retry_after = self._send(message, text, chat.interval)
+            retry_after = self._send(message, reply, chat.interval)
             with self.condition:
                 if retry_after is None:
                     chat.pending.popleft()
-                    if text == BUSY_REPLY:
+                    if isinstance(reply, RollDocument):
+                        self.pending_document_bytes -= len(reply.content)
+                    elif reply == BUSY_REPLY:
                         chat.busy_notice_queued = False
                 chat.ready_at = monotonic() + (chat.interval if retry_after is None else retry_after)
 
-    def _send(self, message: Message, text: str, interval: float) -> float | None:
+    def _send(self, message: Message, reply: Reply, interval: float) -> float | None:
         thread_id = message.message_thread_id if message.is_topic_message else None
         try:
-            self.bot.reply_to(message, text, parse_mode="HTML", message_thread_id=thread_id)
+            if isinstance(reply, RollDocument):
+                with BytesIO(reply.content) as file:
+                    self.bot.send_document(
+                        message.chat.id,
+                        InputFile(file, file_name="roll-results.html"),
+                        caption="Все броски и итог в файле.",
+                        reply_parameters=ReplyParameters(message.message_id),
+                        message_thread_id=thread_id,
+                    )
+            else:
+                self.bot.reply_to(message, reply, parse_mode="HTML", message_thread_id=thread_id)
         except ApiTelegramException as error:
             if error.error_code == 429:
                 parameters = error.result_json.get("parameters") or {}
