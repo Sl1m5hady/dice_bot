@@ -1,0 +1,43 @@
+services:
+  web:
+    environment:
+      WEB_COOKIE_SECURE: "1"
+
+  nginx:
+    image: docker.io/library/nginx:stable-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/dice/nginx-start.sh"]
+    environment:
+      DICE_DOMAIN: ${DICE_DOMAIN:?Set DICE_DOMAIN in .env}
+    depends_on:
+      web:
+        condition: service_started
+        restart: true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/start.sh:/opt/dice/nginx-start.sh:ro,Z
+      - ./deploy/nginx/access-rate.conf:/etc/nginx/conf.d/access-rate.conf:ro,Z
+      - ./deploy/nginx/proxy.conf:/etc/nginx/snippets/dice-proxy.conf:ro,Z
+      - acme:/var/www/certbot:ro
+      - letsencrypt:/etc/letsencrypt:ro
+
+  certbot:
+    image: docker.io/certbot/certbot:v5.10.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/dice/certbot.sh"]
+    environment:
+      DICE_DOMAIN: ${DICE_DOMAIN:?Set DICE_DOMAIN in .env}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:?Set CERTBOT_EMAIL in .env}
+    depends_on:
+      nginx:
+        condition: service_started
+    volumes:
+      - ./deploy/certbot.sh:/opt/dice/certbot.sh:ro,Z
+      - acme:/var/www/certbot
+      - letsencrypt:/etc/letsencrypt
+
+volumes:
+  acme:
+  letsencrypt:

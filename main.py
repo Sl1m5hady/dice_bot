@@ -3,20 +3,25 @@
 from collections import deque
 from dataclasses import dataclass, field
 import logging
+from os import getenv
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from time import monotonic
 
+from dotenv import dotenv_values
 import telebot
 from telebot.apihelper import ApiException
 from telebot.types import Message
 
+from chat_store import ChatStore, chat_settings
 from dice_parser import DICE_SIDES, MAX_EXPRESSION_LENGTH
 from service import find_formulas, roll_replies
+from telegram_bridge import run_bridge
 from telegram_replies import ReplySender
 
 
 TOKEN_PATH = Path("token.txt")
+ENV_PATH = Path(__file__).with_name(".env")
 MAX_FORMULA_FILE_BYTES = 4 * MAX_EXPRESSION_LENGTH
 REQUESTS_PER_WINDOW = 5
 RATE_WINDOW_SECONDS = 10
@@ -44,7 +49,7 @@ HELP = (
     "<code>2d6 — Урон мечом</code> — подпись после тире с пробелами до конца строки.\n\n"
     f"Формулы до {MAX_EXPRESSION_LENGTH} символов можно прислать файлом <code>.txt</code> в UTF-8. "
     "Длинный результат придёт файлом.\n\n"
-    "<code>/start</code> — приветствие. <code>/help</code> — эта справка."
+    "<code>/start</code> — приветствие. <code>/help</code> — эта справка. <code>/chatid</code> — ID чата."
 )
 
 
@@ -85,6 +90,15 @@ class RateLimiter:
             return False, False
 
 
+def validate_token(token: str, source: str) -> str:
+    number, separator, secret = token.partition(":")
+    valid_id = number.isascii() and number.isdecimal()
+    valid_secret = secret and secret.isascii() and all(char.isalnum() or char in "_-" for char in secret)
+    if not (separator and valid_id and valid_secret):
+        raise SystemExit(f"Неверный формат токена в {source}.")
+    return token
+
+
 def read_token(path: Path) -> str:
     try:
         token = path.read_text(encoding="utf-8").strip()
@@ -92,15 +106,19 @@ def read_token(path: Path) -> str:
         raise SystemExit(f"Не удалось прочитать токен из {path}.") from None
     if not token:
         raise SystemExit(f"Файл {path} пуст.")
-    number, separator, secret = token.partition(":")
-    valid_id = number.isascii() and number.isdecimal()
-    valid_secret = secret and secret.isascii() and all(char.isalnum() or char in "_-" for char in secret)
-    if not (separator and valid_id and valid_secret):
-        raise SystemExit(f"Неверный формат токена в {path}.")
-    return token
+    return validate_token(token, str(path))
 
 
-def create_bot(token: str, *, threaded: bool = True) -> telebot.TeleBot:
+def configured_token() -> str:
+    token = getenv("TELEGRAM_TOKEN")
+    if token is None:
+        token = dotenv_values(ENV_PATH).get("TELEGRAM_TOKEN")
+    if token and token.strip():
+        return validate_token(token.strip(), "TELEGRAM_TOKEN")
+    return read_token(Path(getenv("TELEGRAM_TOKEN_FILE") or TOKEN_PATH))
+
+
+def create_bot(token: str, *, threaded: bool = True, chat_store: ChatStore | None = None) -> telebot.TeleBot:
     bot = telebot.TeleBot(token, threaded=threaded)
     limiter = RateLimiter()
     sender = ReplySender(bot, threaded=threaded)
@@ -115,16 +133,33 @@ def create_bot(token: str, *, threaded: bool = True) -> telebot.TeleBot:
             sender.submit(message, (RATE_LIMIT_MESSAGE,))
         return allowed
 
-    @bot.message_handler(commands=["start", "help"])
+    @bot.message_handler(commands=["start", "help", "chatid"])
     def send_help(message: Message) -> None:
         command, separator, recipient = message.text.split(maxsplit=1)[0][1:].partition("@")
         if separator and (not recipient or recipient.casefold() != (bot.user.username or "").casefold()):
             return
         if allow_request(message):
-            sender.submit(message, (HELP if command == "help" else "Привет ✌️ ",))
+            if command == "chatid":
+                text = f"ID чата: <code>{message.chat.id}</code>"
+            else:
+                text = HELP if command == "help" else "Привет ✌️ "
+            sender.submit(message, (text,))
 
     @bot.message_handler(content_types=["text"])
     def roll(message: Message) -> None:
+        if chat_store is not None and message.chat.id == chat_store.active_target():
+            user = message.from_user
+            if message.sender_chat is not None:
+                author = message.sender_chat
+                author_id, name = f"telegram-chat:{author.id}", author.title
+            elif user is not None and not user.is_bot:
+                author_id = f"telegram:{user.id}"
+                name = " ".join(part for part in (user.first_name, user.last_name) if part) or user.username
+            else:
+                return
+            thread_id = message.message_thread_id if message.is_topic_message else None
+            chat_store.add_telegram(message.chat.id, message.message_id, author_id, name or "Игрок", message.text, thread_id)
+            return
         formulas = find_formulas(message.text)
         if formulas and allow_request(message):
             sender.submit(message, roll_replies(formulas))
@@ -170,9 +205,19 @@ def create_bot(token: str, *, threaded: bool = True) -> telebot.TeleBot:
 
 
 def main() -> None:
-    bot = create_bot(read_token(TOKEN_PATH))
+    token = configured_token()
+    initial_target, path = chat_settings()
+    store = ChatStore(path, default_target=initial_target)
+    bot = create_bot(token, chat_store=store)
     telebot.logger.setLevel(logging.INFO)
-    bot.infinity_polling(allowed_updates=["message"])
+    stop = Event()
+    worker = Thread(target=run_bridge, args=(bot, store, stop), name="telegram-bridge", daemon=True)
+    worker.start()
+    try:
+        bot.infinity_polling(allowed_updates=["message"])
+    finally:
+        stop.set()
+        worker.join(timeout=1)
 
 
 if __name__ == "__main__":

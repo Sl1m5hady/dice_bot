@@ -37,6 +37,14 @@ class RollDocument:
     content: bytes
 
 
+def make_roll_document(body: str) -> RollDocument:
+    html = (
+        '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Результаты бросков</title>'
+        f'<pre style="white-space: pre-wrap">{body}</pre></html>'
+    )
+    return RollDocument(html.encode("utf-8"))
+
+
 Reply = str | RollDocument
 
 
@@ -46,6 +54,12 @@ class Result:
     parts: tuple[RenderPart, ...]
     precedence: int = ATOM
     dice_sum: bool = False
+
+
+@dataclass(frozen=True)
+class FormattedRoll:
+    total: str
+    parts: tuple[str, ...]
 
 
 def _parenthesize(parts: tuple[RenderPart, ...], needed: bool) -> tuple[RenderPart, ...]:
@@ -126,14 +140,15 @@ def _fragments(parts: tuple[RenderPart, ...]) -> Iterator[str]:
             pending.extend(reversed(part))
 
 
-def _format_formula(formula: Formula, randint: RandInt) -> tuple[str, ...]:
+def evaluate_formula(formula: Formula, *, randint: RandInt | None = None) -> FormattedRoll:
     if len(formula.description) > MAX_DESCRIPTION_LENGTH:
         raise FormulaError(f"Максимальная длина подписи — {MAX_DESCRIPTION_LENGTH} символов.")
-    result = _evaluate(parse_formula(formula.text), randint)
-    parts = (*_fragments(result.parts), f" = <b>{escape(str(result.value))}</b>")
+    result = _evaluate(parse_formula(formula.text), random.randint if randint is None else randint)
+    total = str(result.value)
+    parts = (*_fragments(result.parts), f" = <b>{escape(total)}</b>")
     if formula.description:
         parts = (*parts, f" — {escape(formula.description)}")
-    return parts
+    return FormattedRoll(total, parts)
 
 
 def _split_replies(lines: Sequence[tuple[str, ...]]) -> list[str]:
@@ -166,21 +181,14 @@ def _split_replies(lines: Sequence[tuple[str, ...]]) -> list[str]:
 def roll_replies(formulas: Sequence[Formula], *, randint: RandInt | None = None) -> list[Reply]:
     if len(formulas) > MAX_FORMULAS:
         return [f"Максимум {MAX_FORMULAS} формул в сообщении."]
-    if randint is None:
-        randint = random.randint
-
     lines = []
     for formula in formulas:
         try:
-            lines.append(_format_formula(formula, randint))
+            lines.append(evaluate_formula(formula, randint=randint).parts)
         except FormulaError as error:
             lines.append((escape(str(error)),))
     replies = _split_replies(lines)
     if len(replies) > MAX_REPLY_PARTS:
         body = "\n".join("".join(line) for line in lines)
-        html = (
-            '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Результаты бросков</title>'
-            f'<pre style="white-space: pre-wrap">{body}</pre></html>'
-        )
-        return [RollDocument(html.encode("utf-8"))]
+        return [make_roll_document(body)]
     return list(replies)

@@ -1,5 +1,6 @@
 from pathlib import Path
 import logging
+from os import environ
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -147,6 +148,7 @@ class TelegramTests(unittest.TestCase):
             path.write_text("  123456:test_only\n", encoding="utf-8")
             with (
                 patch.object(main, "TOKEN_PATH", path),
+                patch.object(main, "chat_settings", return_value=(None, path.with_suffix(".sqlite3"))),
                 patch.object(main.telebot.logger, "setLevel") as set_level,
                 patch.object(main.telebot.TeleBot, "infinity_polling") as poll,
             ):
@@ -166,6 +168,31 @@ class TelegramTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Неверный формат") as caught:
                 main.read_token(path)
             self.assertNotIn("private bad token", str(caught.exception))
+
+    def test_token_source_precedence_and_fallback(self):
+        with TemporaryDirectory() as directory, patch.dict(environ, {}, clear=True):
+            root = Path(directory)
+            token_file = root / "token.txt"
+            env_file = root / ".env"
+            token_file.write_text("123456:file_token\n", encoding="utf-8")
+            env_file.write_text("TELEGRAM_TOKEN=123456:dotenv_token\n", encoding="utf-8")
+            with patch.object(main, "ENV_PATH", env_file), patch.object(main, "TOKEN_PATH", token_file):
+                self.assertEqual(main.configured_token(), "123456:dotenv_token")
+                environ["TELEGRAM_TOKEN"] = "123456:runtime_token"
+                self.assertEqual(main.configured_token(), "123456:runtime_token")
+                environ["TELEGRAM_TOKEN"] = ""
+                self.assertEqual(main.configured_token(), "123456:file_token")
+                del environ["TELEGRAM_TOKEN"]
+                env_file.write_text("TELEGRAM_TOKEN=\n", encoding="utf-8")
+                self.assertEqual(main.configured_token(), "123456:file_token")
+                environ["TELEGRAM_TOKEN"] = "bad-runtime-token"
+                with self.assertRaisesRegex(SystemExit, "Неверный формат токена в TELEGRAM_TOKEN") as invalid:
+                    main.configured_token()
+                self.assertNotIn("bad-runtime-token", str(invalid.exception))
+                del environ["TELEGRAM_TOKEN"]
+                token_file.unlink()
+                with self.assertRaisesRegex(SystemExit, "Не удалось прочитать токен"):
+                    main.configured_token()
 
 
 if __name__ == "__main__":

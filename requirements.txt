@@ -1,1 +1,5 @@
 pyTelegramBotAPI==4.37.1
+fastapi==0.165.0
+uvicorn==0.38.0
+itsdangerous==2.2.0
+python-dotenv==1.2.4

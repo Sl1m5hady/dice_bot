@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#151321">
+  <title>Кубомет</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">⚄</span><span>Кубомет</span></div>
+      <div class="top-actions" id="top-actions" hidden>
+        <button type="button" class="icon-button mobile-saved" id="open-saved" aria-expanded="false" aria-controls="saved-panel" aria-label="Открыть избранное">♡</button>
+        <button type="button" class="icon-button" id="admin-button" title="Настройки Telegram" aria-label="Настройки Telegram" hidden>⚙</button>
+        <button type="button" class="profile-button" id="profile-button" title="Сменить имя"><span id="profile-avatar" class="avatar" aria-hidden="true"></span><span id="profile-name"></span></button>
+        <button type="button" class="text-button" id="logout">Выйти</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <p id="boot-status" class="boot" role="status">Подключаемся…</p>
+    <section id="login-view" class="login" hidden>
+      <span class="login-mark" aria-hidden="true">⚄</span>
+      <h1>Войти в чат</h1>
+      <form id="login-form">
+        <label for="access-code">Код доступа</label>
+        <input id="access-code" type="password" autocomplete="current-password" maxlength="1024" required>
+        <button type="submit" class="primary">Войти</button>
+        <p id="login-status" class="status error" role="status"></p>
+      </form>
+    </section>
+    <div id="table-view" class="workspace" hidden>
+      <section class="chat" aria-labelledby="chat-heading">
+        <header class="chat-header">
+          <div>
+            <h1 id="chat-heading">Общий чат</h1>
+            <p id="connection" class="connection"></p>
+          </div>
+          <p id="feed-status" class="status" role="status"></p>
+        </header>
+        <div id="timeline" class="timeline">
+          <p id="chat-empty" class="chat-empty">Сообщения и броски появятся здесь.</p>
+          <ol id="feed" class="messages" aria-label="Последние сообщения"></ol>
+        </div>
+        <form id="message-form" class="composer">
+          <label class="visually-hidden" for="message">Сообщение или формула</label>
+          <div class="message-box">
+            <textarea id="message" rows="2" maxlength="33123" placeholder="Сообщение или формула, например d20kh+5" required></textarea>
+            <button type="submit" class="primary">Отправить</button>
+          </div>
+          <p id="message-status" class="status error" role="status"></p>
+        </form>
+      </section>
+      <button id="drawer-backdrop" type="button" class="drawer-backdrop" aria-label="Закрыть избранное"></button>
+      <aside id="saved-panel" class="saved" aria-labelledby="saved-heading">
+        <header class="saved-header">
+          <div><h2 id="saved-heading">Избранное</h2></div>
+          <button class="icon-button drawer-close" type="button" id="close-saved" aria-label="Закрыть избранное">×</button>
+        </header>
+        <p id="saved-empty" class="saved-empty">Нажмите ♡ у сообщения или броска, чтобы сохранить его здесь.</p>
+        <ul class="favorites" id="favorites"></ul>
+      </aside>
+    </div>
+  </main>
+
+  <dialog id="profile-dialog" aria-labelledby="profile-title">
+    <form id="profile-form">
+      <h2 id="profile-title">Имя персонажа</h2>
+      <label for="character-name">Имя в чате</label>
+      <input id="character-name" maxlength="60" required placeholder="Например, Лира">
+      <div class="actions">
+        <button type="submit" class="primary">Сохранить</button>
+        <button type="button" class="secondary" id="cancel-profile">Отмена</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="favorite-dialog" aria-labelledby="favorite-title">
+    <form id="favorite-form">
+      <h2 id="favorite-title">Описание в избранном</h2>
+      <p id="favorite-text" class="dialog-formula"></p>
+      <label for="favorite-description">Описание</label>
+      <input id="favorite-description" maxlength="120" placeholder="Например, атака мечом">
+      <div class="actions">
+        <button type="submit" class="primary">Сохранить</button>
+        <button type="button" class="secondary" id="cancel-favorite">Отмена</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="admin-dialog" aria-labelledby="admin-title">
+    <h2 id="admin-title">Настройки Telegram</h2>
+    <form id="admin-login-form" hidden>
+      <label for="admin-code">Код администратора</label>
+      <input id="admin-code" type="password" autocomplete="current-password" maxlength="1024" required>
+      <button type="submit" class="primary admin-submit">Войти</button>
+    </form>
+    <form id="admin-settings-form" hidden>
+      <label for="telegram-target">ID чата</label>
+      <input id="telegram-target" maxlength="20" spellcheck="false" placeholder="Например, -1001234567890" aria-describedby="admin-target-help">
+      <p class="admin-note" id="admin-target-help">Введите <code>/chatid</code> у бота в группе или личке. Пустое поле отключает связь с Telegram.</p>
+      <p class="admin-note admin-warning" id="private-warning" hidden>Сообщения из этой лички будут видны всем участникам с кодом входа. Для теста сначала отправьте боту <code>/start</code>.</p>
+      <button type="submit" class="primary admin-submit">Сохранить</button>
+    </form>
+    <p id="admin-status" class="status" role="status"></p>
+    <div class="actions"><button type="button" class="secondary" id="close-admin">Закрыть</button></div>
+  </dialog>
+</body>
+</html>
